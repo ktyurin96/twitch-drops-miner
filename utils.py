@@ -13,6 +13,9 @@ import traceback
 import webbrowser
 import tkinter as tk
 from enum import Enum
+import subprocess
+import shutil
+import threading
 from pathlib import Path
 from functools import wraps
 from contextlib import suppress
@@ -456,3 +459,131 @@ class Game:
 
     def is_special(self) -> bool:
         return self.id in self.SPECIAL_GAME_IDS
+
+
+# Sleep inhibitor helpers
+class _SleepInhibitor:
+    def __init__(self):
+        self._proc: subprocess.Popen | None = None
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    def _start_xdg_loop(self) -> None:
+        xdg = shutil.which("xdg-screensaver")
+        if not xdg:
+            return
+
+        def loop() -> None:
+            while not self._stop_event.wait(30):
+                try:
+                    subprocess.run([xdg, "reset"], timeout=5)
+                except Exception:
+                    pass
+
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+
+    def start(self) -> None:
+        # if already started and still running, don't start again
+        try:
+            if self._proc is not None and self._proc.poll() is None:
+                return
+        except Exception:
+            pass
+        if self._thread is not None and self._thread.is_alive():
+            return
+
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                ES_CONTINUOUS = 0x80000000
+                ES_SYSTEM_REQUIRED = 0x00000001
+                ES_AWAYMODE_REQUIRED = 0x00000040
+                flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+                # Attempt to include away mode (may not exist on older systems)
+                try:
+                    flags |= ES_AWAYMODE_REQUIRED
+                except Exception:
+                    pass
+                ctypes.windll.kernel32.SetThreadExecutionState(flags)
+            except Exception:
+                logger.exception("Failed to set Windows execution state")
+            return
+
+        # macOS: prefer caffeinate
+        if sys.platform == "darwin":
+            caffeinate = shutil.which("caffeinate")
+            if caffeinate:
+                try:
+                    self._proc = subprocess.Popen([caffeinate, "-dims"])  # keep system, display, idle
+                    return
+                except Exception:
+                    logger.exception("Failed to start caffeinate")
+            # fallback to xdg loop
+            self._start_xdg_loop()
+            return
+
+        # Linux/other: try systemd-inhibit, then caffeinate, then xdg-screensaver reset loop
+        systemd_inhibit = shutil.which("systemd-inhibit")
+        if systemd_inhibit:
+            try:
+                self._proc = subprocess.Popen([
+                    systemd_inhibit,
+                    '--who=Twitch Drops Miner',
+                    "--why=Майнинг",
+                    "--what=sleep:shutdown",
+                    "sleep",
+                    "infinity",
+                ])
+                return
+            except Exception:
+                logger.exception("Failed to start systemd-inhibit")
+        caffeinate = shutil.which("caffeinate")
+        if caffeinate:
+            try:
+                self._proc = subprocess.Popen([caffeinate, "-d"])  # prevent display sleep
+                return
+            except Exception:
+                logger.exception("Failed to start caffeinate")
+        # last resort: periodically reset screensaver
+        self._start_xdg_loop()
+
+    def stop(self) -> None:
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                ES_CONTINUOUS = 0x80000000
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            except Exception:
+                logger.exception("Failed to clear Windows execution state")
+            return
+
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            self._proc = None
+        if self._thread is not None:
+            self._stop_event.set()
+            self._thread = None
+
+
+_sleep_inhibitor = _SleepInhibitor()
+
+
+def prevent_sleep_start() -> None:
+    try:
+        _sleep_inhibitor.start()
+    except Exception:
+        logger.exception("prevent_sleep_start failed")
+
+
+def prevent_sleep_stop() -> None:
+    try:
+        _sleep_inhibitor.stop()
+    except Exception:
+        logger.exception("prevent_sleep_stop failed")
+

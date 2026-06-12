@@ -17,6 +17,8 @@ if __name__ == "__main__":
     import traceback
     import tkinter as tk
     from tkinter import messagebox
+    import subprocess
+    from pathlib import Path
     from typing import NoReturn, TYPE_CHECKING
 
     import truststore
@@ -29,6 +31,7 @@ if __name__ == "__main__":
     from exceptions import CaptchaRequired
     from utils import lock_file, resource_path, set_root_icon
     from constants import LOGGING_LEVELS, SELF_PATH, FILE_FORMATTER, LOG_PATH, LOCK_PATH
+    from constants import WORKING_DIR, IS_PACKAGED
 
     if TYPE_CHECKING:
         from _typeshed import SupportsWrite
@@ -202,6 +205,21 @@ if __name__ == "__main__":
         if not success:
             # already running - exit
             sys.exit(3)
+
+        # If running from a git checkout (dev mode), update from remote before launching.
+        try:
+            if not IS_PACKAGED and (Path(WORKING_DIR) / ".git").exists():
+                git = shutil.which("git") if 'shutil' in globals() else None
+                if git is None:
+                    import shutil as _sh
+                    git = _sh.which("git")
+                if git:
+                    # fast-forward only to avoid merge prompts
+                    subprocess.run([git, "-C", str(WORKING_DIR), "pull", "--ff-only"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            # don't fail startup if update fails
+            pass
 
         asyncio.run(main())
     finally:

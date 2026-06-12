@@ -39,6 +39,8 @@ from utils import (
     RateLimiter,
     AwaitableValue,
     ExponentialBackoff,
+    prevent_sleep_start,
+    prevent_sleep_stop,
 )
 from constants import (
     CALL,
@@ -1034,6 +1036,7 @@ class Twitch:
         self.gui.tray.change_icon("active")
         self.gui.channels.set_watching(channel)
         self.watching_channel.set(channel)
+        prevent_sleep_start()
         if update_status:
             status_text = _("status", "watching").format(channel=channel.name)
             self.print(status_text)
@@ -1043,6 +1046,7 @@ class Twitch:
         self.gui.clear_drop()
         self.watching_channel.clear()
         self.gui.channels.clear_watching()
+        prevent_sleep_stop()
 
     def restart_watching(self):
         self.gui.progress.stop_timer()
