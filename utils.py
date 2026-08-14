@@ -532,7 +532,7 @@ class _SleepInhibitor:
                     systemd_inhibit,
                     '--who=Twitch Drops Miner',
                     "--why=Майнинг",
-                    "--what=sleep:shutdown",
+                    "--what=sleep",
                     "sleep",
                     "infinity",
                 ])
