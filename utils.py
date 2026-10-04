@@ -461,12 +461,15 @@ class Game:
         return self.id in self.SPECIAL_GAME_IDS
 
 
-# Sleep inhibitor helpers
 class _SleepInhibitor:
     def __init__(self):
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+
+        # Ресурсы D-Bus
+        self._dbus_screensaver_cookie: int | None = None
+        self._dbus_logind_fd: int | None = None
 
     def _start_xdg_loop(self) -> None:
         xdg = shutil.which("xdg-screensaver")
@@ -483,8 +486,68 @@ class _SleepInhibitor:
         self._thread = threading.Thread(target=loop, daemon=True)
         self._thread.start()
 
+    def _try_linux_dbus(self) -> bool:
+        """Попытка заблокировать сон через D-Bus. Возвращает True в случае успеха."""
+        try:
+            import dbus
+        except ImportError:
+            logger.debug("Модуль dbus не найден. Переход к fallback-методам.")
+            return False
+
+        success = False
+
+        # 1. Блокировка сна системы через logind (System Bus)
+        # Это АНАЛОГ 'systemd-inhibit --what=sleep'. Система не уснет, но ЭКРАН СМОЖЕТ ГАСНУТЬ.
+        try:
+            system_bus = dbus.SystemBus()
+            login = system_bus.get_object('org.freedesktop.login1', '/org/freedesktop/login1')
+            manager = dbus.Interface(login, dbus_interface='org.freedesktop.login1.Manager')
+
+            # Параметры: what, who, why, mode
+            fd_obj = manager.Inhibit('sleep', 'Twitch Drops Miner', 'Майнинг', 'block')
+            self._dbus_logind_fd = fd_obj.take()  # Забираем файловый дескриптор (int)
+            success = True
+        except Exception as e:
+            logger.debug(f"Не удалось заблокировать систему через logind (D-Bus): {e}")
+
+        # 2. Блокировка хранителя экрана (Session Bus)
+        # Это АНАЛОГ 'xdg-screensaver reset'. НЕ ДАЕТ ЭКРАНУ ГАСНУТЬ.
+        # Если вы хотите, чтобы монитор уходил в спящий режим — просто удалите или закомментируйте этот try-блок.
+        try:
+            session_bus = dbus.SessionBus()
+            saver = session_bus.get_object('org.freedesktop.ScreenSaver', '/org/freedesktop/ScreenSaver')
+            self._dbus_screensaver_cookie = saver.Inhibit(
+                'Twitch Drops Miner',
+                'Майнинг',
+                dbus_interface='org.freedesktop.ScreenSaver'
+            )
+            success = True
+        except Exception as e:
+            logger.debug(f"Не удалось заблокировать ScreenSaver (D-Bus): {e}")
+
+        return success
+
+    def _release_linux_dbus(self) -> None:
+        """Снятие D-Bus блокировок."""
+        if self._dbus_screensaver_cookie is not None:
+            try:
+                import dbus
+                session_bus = dbus.SessionBus()
+                saver = session_bus.get_object('org.freedesktop.ScreenSaver', '/org/freedesktop/ScreenSaver')
+                saver.UnInhibit(self._dbus_screensaver_cookie, dbus_interface='org.freedesktop.ScreenSaver')
+            except Exception as e:
+                logger.error(f"Ошибка снятия D-Bus ScreenSaver: {e}")
+            self._dbus_screensaver_cookie = None
+
+        if self._dbus_logind_fd is not None:
+            try:
+                os.close(self._dbus_logind_fd)
+            except Exception as e:
+                logger.error(f"Ошибка закрытия D-Bus logind fd: {e}")
+            self._dbus_logind_fd = None
+
     def start(self) -> None:
-        # if already started and still running, don't start again
+        # Проверка, не запущен ли уже ингибитор
         try:
             if self._proc is not None and self._proc.poll() is None:
                 return
@@ -492,16 +555,17 @@ class _SleepInhibitor:
             pass
         if self._thread is not None and self._thread.is_alive():
             return
+        if self._dbus_logind_fd is not None or self._dbus_screensaver_cookie is not None:
+            return
 
+        # Windows
         if sys.platform == "win32":
             try:
                 import ctypes
-
                 ES_CONTINUOUS = 0x80000000
                 ES_SYSTEM_REQUIRED = 0x00000001
                 ES_AWAYMODE_REQUIRED = 0x00000040
                 flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED
-                # Attempt to include away mode (may not exist on older systems)
                 try:
                     flags |= ES_AWAYMODE_REQUIRED
                 except Exception:
@@ -520,11 +584,15 @@ class _SleepInhibitor:
                     return
                 except Exception:
                     logger.exception("Failed to start caffeinate")
-            # fallback to xdg loop
             self._start_xdg_loop()
             return
 
-        # Linux/other: try systemd-inhibit, then caffeinate, then xdg-screensaver reset loop
+        # Linux/other
+        # 1. Пытаемся использовать нативный D-Bus (чистое решение)
+        if self._try_linux_dbus():
+            return
+
+        # 2. Если D-Bus недоступен (например, нет пакета dbus-python), используем старые методы (fallback)
         systemd_inhibit = shutil.which("systemd-inhibit")
         if systemd_inhibit:
             try:
@@ -539,33 +607,39 @@ class _SleepInhibitor:
                 return
             except Exception:
                 logger.exception("Failed to start systemd-inhibit")
+
         caffeinate = shutil.which("caffeinate")
         if caffeinate:
             try:
-                self._proc = subprocess.Popen([caffeinate, "-d"])  # prevent display sleep
+                self._proc = subprocess.Popen([caffeinate, "-d"])
                 return
             except Exception:
                 logger.exception("Failed to start caffeinate")
-        # last resort: periodically reset screensaver
+
+        # last resort
         self._start_xdg_loop()
 
     def stop(self) -> None:
         if sys.platform == "win32":
             try:
                 import ctypes
-
                 ES_CONTINUOUS = 0x80000000
                 ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
             except Exception:
                 logger.exception("Failed to clear Windows execution state")
             return
 
+        # Освобождаем D-Bus ресурсы (Linux)
+        self._release_linux_dbus()
+
+        # Завершаем fallback-процессы (Linux/macOS)
         if self._proc is not None:
             try:
                 self._proc.terminate()
             except Exception:
                 pass
             self._proc = None
+
         if self._thread is not None:
             self._stop_event.set()
             self._thread = None
