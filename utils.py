@@ -510,21 +510,6 @@ class _SleepInhibitor:
         except Exception as e:
             logger.debug(f"Не удалось заблокировать систему через logind (D-Bus): {e}")
 
-        # 2. Блокировка хранителя экрана (Session Bus)
-        # Это АНАЛОГ 'xdg-screensaver reset'. НЕ ДАЕТ ЭКРАНУ ГАСНУТЬ.
-        # Если вы хотите, чтобы монитор уходил в спящий режим — просто удалите или закомментируйте этот try-блок.
-        try:
-            session_bus = dbus.SessionBus()
-            saver = session_bus.get_object('org.freedesktop.ScreenSaver', '/org/freedesktop/ScreenSaver')
-            self._dbus_screensaver_cookie = saver.Inhibit(
-                'Twitch Drops Miner',
-                'Майнинг',
-                dbus_interface='org.freedesktop.ScreenSaver'
-            )
-            success = True
-        except Exception as e:
-            logger.debug(f"Не удалось заблокировать ScreenSaver (D-Bus): {e}")
-
         return success
 
     def _release_linux_dbus(self) -> None:
